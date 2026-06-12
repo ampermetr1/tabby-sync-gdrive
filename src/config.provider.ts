@@ -17,8 +17,8 @@ export class GDriveSyncConfigProvider extends ConfigProvider {
       // Auto-sync on Tabby startup
       autoSyncOnStartup: true,
 
-      // Minimum interval between syncs (in minutes)
-      syncIntervalMinutes: 5,
+      // Minimum interval between automatic syncs (in minutes)
+      syncIntervalMinutes: 60,
 
       // OAuth tokens - stored encrypted by Tabby vault
       googleAuthTokens: null,

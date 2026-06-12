@@ -73,6 +73,92 @@ import { SyncVersion } from '../interfaces/sync.interface';
         </div>
       </div>
 
+      <!-- Sync Password -->
+      <div class="password-section">
+        <h4>
+          <i class="fas fa-key"></i>
+          Sync Password
+        </h4>
+        <div class="help-text">
+          Use the same password on every machine. The password itself is not
+          stored; only a local verification hash is saved.
+        </div>
+        <div class="password-input-row">
+          <input
+            class="form-control"
+            type="password"
+            autocomplete="new-password"
+            placeholder="Sync password"
+            [(ngModel)]="masterPasswordInput"
+            (keyup.enter)="saveMasterPassword()"
+          />
+          <button
+            class="btn btn-success"
+            (click)="saveMasterPassword()"
+            [disabled]="isSavingPassword || !masterPasswordInput"
+          >
+            <i class="fas fa-unlock"></i>
+            Unlock
+          </button>
+        </div>
+        <div class="password-actions">
+          <button
+            class="btn btn-secondary"
+            (click)="changeMasterPassword()"
+            [disabled]="isSavingPassword || !masterPasswordInput"
+          >
+            <i class="fas fa-key"></i>
+            Set / change password
+          </button>
+        </div>
+        <div class="password-ok" *ngIf="passwordConfigured && !passwordMessage">
+          <i class="fas fa-check-circle"></i> Sync password configured
+        </div>
+        <div class="password-ok" *ngIf="passwordMessage">
+          <i class="fas fa-check-circle"></i> {{ passwordMessage }}
+        </div>
+        <div class="password-error" *ngIf="passwordError">
+          <i class="fas fa-exclamation-triangle"></i> {{ passwordError }}
+        </div>
+      </div>
+
+      <!-- Sync Settings -->
+      <div class="settings-section">
+        <h4>
+          <i class="fas fa-sliders-h"></i>
+          Sync Settings
+        </h4>
+        <div class="input-group">
+          <label for="gdrive-sync-interval">Automatic sync interval</label>
+          <div class="interval-input-row">
+            <input
+              id="gdrive-sync-interval"
+              class="form-control interval-input"
+              type="number"
+              min="1"
+              step="1"
+              [(ngModel)]="syncIntervalMinutes"
+              (keyup.enter)="saveSyncInterval()"
+            />
+            <span class="input-suffix">minutes</span>
+            <button
+              class="btn btn-secondary"
+              (click)="saveSyncInterval()"
+              [disabled]="isSavingSettings"
+            >
+              <i class="fas fa-save"></i>
+              Save
+            </button>
+          </div>
+        </div>
+        <div class="password-ok" *ngIf="settingsMessage">
+          <i class="fas fa-check-circle"></i> {{ settingsMessage }}
+        </div>
+        <div class="password-error" *ngIf="settingsError">
+          <i class="fas fa-exclamation-triangle"></i> {{ settingsError }}
+        </div>
+      </div>
+
       <!-- Google Drive Connection -->
       <div class="button-row">
         <button
@@ -285,6 +371,13 @@ import { SyncVersion } from '../interfaces/sync.interface';
         margin: 20px 0;
       }
 
+      .settings-section {
+        background: var(--bs-body-bg);
+        border-radius: 8px;
+        padding: 15px;
+        margin: 20px 0;
+      }
+
       .help-text {
         font-size: 0.85rem;
         opacity: 0.8;
@@ -295,6 +388,21 @@ import { SyncVersion } from '../interfaces/sync.interface';
         display: flex;
         gap: 8px;
         margin-bottom: 10px;
+      }
+
+      .interval-input-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .interval-input {
+        max-width: 120px;
+      }
+
+      .input-suffix {
+        opacity: 0.8;
+        font-size: 0.9rem;
       }
 
       .form-control {
@@ -458,6 +566,15 @@ export class SettingsComponent implements OnInit, OnDestroy {
   driveStatus: DriveConnectionStatus | null = null;
   syncState: SyncState | null = null;
   isConnecting = false;
+  isSavingPassword = false;
+  isSavingSettings = false;
+  masterPasswordInput = '';
+  passwordError = '';
+  passwordMessage = '';
+  passwordConfigured = false;
+  syncIntervalMinutes = 60;
+  settingsError = '';
+  settingsMessage = '';
 
   // Version History
   versions: SyncVersion[] = [];
@@ -473,14 +590,13 @@ export class SettingsComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
+    this.passwordConfigured = this.sync.isPasswordConfigured();
+    this.syncIntervalMinutes = this.sync.getSyncIntervalMinutes();
+
     // Subscribe to drive status
     this.subscriptions.push(
       this.sync.getDriveStatus().subscribe((status) => {
         this.driveStatus = status;
-        if (status.connected) {
-          // If connected, ensure security is ready
-          this.sync.useDefaultPassword();
-        }
       }),
     );
 
@@ -496,14 +612,94 @@ export class SettingsComponent implements OnInit, OnDestroy {
     this.subscriptions.forEach((sub) => sub.unsubscribe());
   }
 
+  async saveMasterPassword(): Promise<void> {
+    const password = this.masterPasswordInput.trim();
+    if (!password) {
+      this.passwordError = 'Enter sync password';
+      return;
+    }
+
+    this.isSavingPassword = true;
+    this.passwordError = '';
+    this.passwordMessage = '';
+    try {
+      if (this.sync.isPasswordConfigured()) {
+        if (!this.sync.setMasterPassword(password)) {
+          this.passwordError = 'Wrong sync password';
+          return;
+        }
+      } else {
+        await this.sync.setupMasterPassword(password);
+      }
+
+      this.passwordConfigured = true;
+      this.passwordMessage = 'Sync password unlocked';
+      this.masterPasswordInput = '';
+
+      if (this.driveStatus?.connected) {
+        this.sync.fullSync();
+      }
+    } finally {
+      this.isSavingPassword = false;
+    }
+  }
+
+  async changeMasterPassword(): Promise<void> {
+    const password = this.masterPasswordInput.trim();
+    if (!password) {
+      this.passwordError = 'Enter new sync password';
+      return;
+    }
+
+    this.isSavingPassword = true;
+    this.passwordError = '';
+    this.passwordMessage = '';
+    try {
+      if (await this.sync.changeMasterPassword(password)) {
+        this.passwordConfigured = true;
+        this.passwordMessage = 'Sync password saved';
+        this.masterPasswordInput = '';
+      } else {
+        this.passwordError = 'Failed to save sync password';
+      }
+    } finally {
+      this.isSavingPassword = false;
+    }
+  }
+
+  async saveSyncInterval(): Promise<void> {
+    const minutes = Number(this.syncIntervalMinutes);
+    if (!Number.isFinite(minutes) || minutes < 1) {
+      this.settingsError = 'Enter an interval of at least 1 minute';
+      return;
+    }
+
+    this.isSavingSettings = true;
+    this.settingsError = '';
+    this.settingsMessage = '';
+    try {
+      await this.sync.setSyncIntervalMinutes(minutes);
+      this.syncIntervalMinutes = this.sync.getSyncIntervalMinutes();
+      this.settingsMessage = 'Sync interval saved';
+    } catch (error) {
+      this.settingsError =
+        'Failed to save sync interval: ' + (error as Error).message;
+    } finally {
+      this.isSavingSettings = false;
+    }
+  }
+
   async connectGoogleDrive(): Promise<void> {
+    if (!this.sync.hasPassword()) {
+      this.passwordError = 'Set or unlock sync password first';
+      return;
+    }
+
     this.isConnecting = true;
     try {
       const success = await this.sync.connectGoogleDrive();
       if (success) {
         await this.sync.setEnabled(true);
-        // Using default password automatically
-        await this.sync.useDefaultPassword();
         // Trigger initial sync
         this.sync.fullSync();
       }

@@ -53,7 +53,9 @@ import * as path from 'path';
 /** Retry configuration */
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY_MS = 1000;
-const SYNC_DEBOUNCE_MS = 5000; // Wait 5 seconds after last change before syncing
+const SYNC_DEBOUNCE_MS = 5000; // Wait 5 seconds after last change before scheduling sync
+const DEFAULT_SYNC_INTERVAL_MINUTES = 60;
+const MIN_SYNC_INTERVAL_MINUTES = 1;
 
 /**
  * Current sync state for UI
@@ -74,6 +76,9 @@ export class SyncService {
 
   /** Subscription to config changes */
   private configChangeSub: Subscription | null = null;
+
+  /** Pending delayed auto-sync timer */
+  private pendingAutoSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Sync state observable */
   private syncState = new BehaviorSubject<SyncState>({
@@ -116,8 +121,15 @@ export class SyncService {
     if (!this.config.store.gdrivesync) {
       this.config.store.gdrivesync = {};
     }
-    Object.assign(this.config.store.gdrivesync as object, config);
-    await this.config.save();
+
+    const wasApplyingRemote = this.isApplyingRemote;
+    this.isApplyingRemote = true;
+    try {
+      Object.assign(this.config.store.gdrivesync as object, config);
+      await this.config.save();
+    } finally {
+      this.isApplyingRemote = wasApplyingRemote;
+    }
   }
 
   /**
@@ -157,15 +169,24 @@ export class SyncService {
             });
           }
 
-          // Unlock encryption and sync from remote on startup
-          const unlocked = await this.useDefaultPassword();
-          if (unlocked) {
-            this.log.info('Auto-sync: pulling config from remote...');
-            this.fullSync().catch((err) => {
-              this.log.error('Auto-sync on startup failed:', err);
-            });
+          // Startup sync requires the user to unlock the sync password first.
+          if (this.hasPassword()) {
+            if (pluginConfig.autoSyncOnStartup === false) {
+              this.log.info('Auto-sync on startup disabled');
+            } else if (this.shouldRunAutoSyncNow()) {
+              this.log.info('Auto-sync: pulling config from remote...');
+              this.fullSync().catch((err) => {
+                this.log.error('Auto-sync on startup failed:', err);
+              });
+            } else {
+              this.log.info(
+                'Auto-sync on startup skipped: last sync was too recent',
+              );
+            }
           } else {
-            this.log.warn('Auto-sync skipped: failed to unlock master password');
+            this.log.info(
+              'Auto-sync on startup skipped: sync password is not unlocked',
+            );
           }
         }
       } catch (error) {
@@ -226,6 +247,27 @@ export class SyncService {
   }
 
   /**
+   * Changes the sync password and re-encrypts the remote file when connected.
+   *
+   * @param password - New master password
+   * @returns True if the password was saved and remote re-encryption succeeded
+   */
+  async changeMasterPassword(password: string): Promise<boolean> {
+    if (!password) {
+      return false;
+    }
+
+    await this.setupMasterPassword(password);
+
+    if (this.drive.isConnected()) {
+      const result = await this.syncToRemote();
+      return result.success;
+    }
+
+    return true;
+  }
+
+  /**
    * Checks if master password is set in memory.
    */
   hasPassword(): boolean {
@@ -252,17 +294,14 @@ export class SyncService {
   }
 
   /**
-   * Automatically configures/unlocks with default password '123456'.
+   * Default sync password is intentionally disabled.
+   * Users must enter the sync password in plugin settings.
    */
   async useDefaultPassword(): Promise<boolean> {
-    const DEFAULT_PASS = '123456';
-
-    if (!this.isPasswordConfigured()) {
-      await this.setupMasterPassword(DEFAULT_PASS);
-      return true;
-    } else {
-      return this.setMasterPassword(DEFAULT_PASS);
-    }
+    this.log.warn(
+      'Default sync password disabled; enter sync password in settings',
+    );
+    return false;
   }
 
   /**
@@ -332,6 +371,100 @@ export class SyncService {
   }
 
   /**
+   * Returns configured automatic sync interval in minutes.
+   */
+  getSyncIntervalMinutes(): number {
+    const pluginConfig = this.getPluginConfig();
+    const configured = Number(pluginConfig.syncIntervalMinutes);
+
+    if (!Number.isFinite(configured) || configured < MIN_SYNC_INTERVAL_MINUTES) {
+      return DEFAULT_SYNC_INTERVAL_MINUTES;
+    }
+
+    return Math.floor(configured);
+  }
+
+  /**
+   * Updates automatic sync interval in minutes.
+   */
+  async setSyncIntervalMinutes(minutes: number): Promise<void> {
+    const normalized = Math.max(
+      MIN_SYNC_INTERVAL_MINUTES,
+      Math.floor(Number(minutes) || DEFAULT_SYNC_INTERVAL_MINUTES),
+    );
+
+    await this.savePluginConfig({ syncIntervalMinutes: normalized });
+    this.log.info(`Sync interval set to ${normalized} minute(s)`);
+  }
+
+  /**
+   * Calculates the configured automatic sync interval.
+   */
+  private getAutoSyncIntervalMs(): number {
+    return this.getSyncIntervalMinutes() * 60 * 1000;
+  }
+
+  /**
+   * Returns true when startup auto-sync is allowed by the configured interval.
+   */
+  private shouldRunAutoSyncNow(): boolean {
+    const lastSyncTime = Number(this.getPluginConfig().lastSyncTime) || 0;
+    return (
+      !lastSyncTime ||
+      Date.now() - lastSyncTime >= this.getAutoSyncIntervalMs()
+    );
+  }
+
+  /**
+   * Schedules an automatic sync without exceeding the configured interval.
+   */
+  private scheduleAutoSync(): void {
+    this.zone.run(() => {
+      this.updateSyncState({ pendingChanges: true });
+    });
+
+    if (!this.masterPassword) {
+      this.log.debug('Auto-sync postponed: sync password is not unlocked');
+      return;
+    }
+
+    if (!this.drive.isConnected()) {
+      this.log.debug('Auto-sync postponed: Google Drive is not connected');
+      return;
+    }
+
+    const intervalMs = this.getAutoSyncIntervalMs();
+    const lastSyncTime = Number(this.getPluginConfig().lastSyncTime) || 0;
+    const delayMs = lastSyncTime
+      ? Math.max(0, intervalMs - (Date.now() - lastSyncTime))
+      : 0;
+
+    if (this.pendingAutoSyncTimer) {
+      clearTimeout(this.pendingAutoSyncTimer);
+      this.pendingAutoSyncTimer = null;
+    }
+
+    this.pendingAutoSyncTimer = setTimeout(() => {
+      this.pendingAutoSyncTimer = null;
+      this.zone.run(() => {
+        this.syncToRemote().catch((error) => {
+          this.log.error('Auto-sync failed:', error);
+        });
+      });
+    }, delayMs);
+
+    if (delayMs > 0) {
+      this.log.debug(
+        `Auto-sync delayed to respect sync interval (${Math.ceil(
+          delayMs / 60000,
+        )} min remaining)`,
+      );
+    } else {
+      this.log.debug('Auto-sync scheduled immediately');
+    }
+  }
+
+  /**
    * Starts watching for config changes.
    */
   private startWatchingChanges(): void {
@@ -343,16 +476,11 @@ export class SyncService {
 
     this.configChangeSub = this.config.changed$
       .pipe(
-        filter(() => !this.isApplyingRemote), // Ignore changes from applying remote
+        filter(() => !this.isApplyingRemote), // Ignore changes from applying remote/plugin metadata
         debounceTime(SYNC_DEBOUNCE_MS),
       )
       .subscribe(() => {
-        this.zone.run(() => {
-          this.updateSyncState({ pendingChanges: true });
-          this.syncToRemote().catch((error) => {
-            this.log.error('Auto-sync failed:', error);
-          });
-        });
+        this.scheduleAutoSync();
       });
   }
 
@@ -364,6 +492,11 @@ export class SyncService {
       this.configChangeSub.unsubscribe();
       this.configChangeSub = null;
       this.log.debug('Stopped config change watcher');
+    }
+
+    if (this.pendingAutoSyncTimer) {
+      clearTimeout(this.pendingAutoSyncTimer);
+      this.pendingAutoSyncTimer = null;
     }
   }
 

@@ -14,7 +14,7 @@ Synchronize your Tabby SSH profiles, saved passwords, terminal settings, snippet
 - **🛣️ Smart Path Mapping**: Automatically handles cross-platform paths (Windows/macOS/Linux) for backgrounds and CWD
 - **�🔀 Smart Merge**: Conflict resolution based on timestamps
 - **🛡️ Privacy First**: SSH private keys are NEVER synced
-- **⚡ Auto-sync**: Detects config changes and syncs automatically
+- **⚡ Auto-sync**: Detects config changes and syncs automatically with a configurable interval
 - **📁 AppData Storage**: Uses Google Drive's hidden app folder (invisible to users)
 - **🌐 Cross-Platform**: Windows, macOS, Linux support
 
@@ -86,9 +86,11 @@ Fully supports syncing snippets/commands created with the popular `quick-cmds` p
 ## 🚀 Quick Start
 
 1. Open **Tabby** -> **Settings** -> **Google Drive Sync**
-2. Click **"Connect Google Drive"**
-3. Sign in with your Google account
-4. Done! Your settings will now sync automatically.
+2. Enter a **Sync Password** and click **Set / change password**
+3. Optional: adjust the **Automatic sync interval** in minutes
+4. Click **"Connect Google Drive"**
+5. Sign in with your Google account
+6. Done! Your settings will now sync automatically.
 
 ## ⚠️ Security & Privacy
 
@@ -96,6 +98,7 @@ Fully supports syncing snippets/commands created with the popular `quick-cmds` p
 
 - All sync data is encrypted with **AES-256-GCM**
 - Encryption uses **PBKDF2** for key derivation
+- The sync password is configured in plugin settings and is not stored in plaintext
 - Each encryption uses unique IV and salt
 - Data is stored in Google Drive's **AppData folder**, which is hidden from normal view and only accessible by this plugin.
 
