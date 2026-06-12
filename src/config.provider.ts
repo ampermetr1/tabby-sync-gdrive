@@ -23,6 +23,19 @@ export class GDriveSyncConfigProvider extends ConfigProvider {
       // OAuth tokens - stored encrypted by Tabby vault
       googleAuthTokens: null,
 
+      // OAuth app credentials
+      useCustomGoogleCredentials: false,
+      googleClientId: null,
+      googleClientSecret: null,
+
+      // Remote storage target
+      driveStorageMode: 'appDataFolder',
+      driveFolderPath: '/Tabby Sync/',
+
+      // Version history
+      versionHistoryMode: 'googleRevisions',
+      maxVersionFiles: 20,
+
       // Master password hash (NEVER store plaintext)
       masterPasswordHash: null,
       masterPasswordSalt: null,

@@ -239,6 +239,10 @@ export interface SyncPayload {
   settings: SyncableSettings;
 }
 
+export type DriveStorageMode = 'appDataFolder' | 'driveFolder';
+
+export type VersionHistoryMode = 'googleRevisions' | 'timestampedFiles';
+
 /**
  * Plugin-specific configuration stored in Tabby config
  */
@@ -254,6 +258,21 @@ export interface GDriveSyncConfig {
     refresh_token?: string;
     expiry_date?: number;
   };
+
+  // Optional custom OAuth app credentials
+  useCustomGoogleCredentials?: boolean;
+  googleClientId?: string;
+  googleClientSecretEncrypted?: string;
+  /** @deprecated legacy plaintext secret, migrated when settings are saved */
+  googleClientSecret?: string;
+
+  // Remote storage target
+  driveStorageMode?: DriveStorageMode;
+  driveFolderPath?: string;
+
+  // Version history storage
+  versionHistoryMode?: VersionHistoryMode;
+  maxVersionFiles?: number;
 
   // Master password hash for verification (NEVER store plaintext password)
   masterPasswordHash?: string;
@@ -276,6 +295,7 @@ export interface SyncVersion {
   modifiedTime: string;
   size?: string | null;
   name?: string;
+  source?: VersionHistoryMode;
 }
 
 /**

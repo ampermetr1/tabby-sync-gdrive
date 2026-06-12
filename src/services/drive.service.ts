@@ -7,8 +7,9 @@
  * - Implements OAuth 2.0 Desktop App flow
  * - Handles token refresh automatically
  *
- * SCOPE: https://www.googleapis.com/auth/drive.appdata
- * This scope only allows access to the app-specific folder, not user's files.
+ * SCOPE:
+ * - https://www.googleapis.com/auth/drive.appdata for hidden app storage
+ * - https://www.googleapis.com/auth/drive.file for visible Drive folder storage
  */
 
 import { Injectable, NgZone } from '@angular/core';
@@ -18,17 +19,46 @@ import { OAuth2Client, Credentials } from 'google-auth-library';
 import { BehaviorSubject, Observable } from 'rxjs';
 import * as http from 'http';
 import * as url from 'url';
+import { VersionHistoryMode } from '../interfaces/sync.interface';
 
 /** Google OAuth configuration */
-const SCOPES = ['https://www.googleapis.com/auth/drive.appdata'];
+const APP_DATA_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const SYNC_FILE_NAME = 'tabby-sync.json';
+const SNAPSHOT_FILE_PREFIX = 'tabby-sync-';
+const SNAPSHOT_FILE_EXTENSION = '.json';
 const REDIRECT_PORT = 45678; // Local port for OAuth callback
 const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}/oauth2callback`;
 
-/** Hardcoded OAuth credentials */
+/** Built-in OAuth credentials can be injected by the package build. */
 const GOOGLE_CLIENT_ID =
-  '1034070286602-m5arl71ke9ctad6905psbsaencjheeeu.apps.googleusercontent.com';
-const GOOGLE_CLIENT_SECRET = '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';
+  typeof process !== 'undefined'
+    ? process.env['TABBY_SYNC_GDRIVE_GOOGLE_CLIENT_ID'] || ''
+    : '';
+const GOOGLE_CLIENT_SECRET =
+  typeof process !== 'undefined'
+    ? process.env['TABBY_SYNC_GDRIVE_GOOGLE_CLIENT_SECRET'] || ''
+    : '';
+
+export type DriveStorageMode = 'appDataFolder' | 'driveFolder';
+
+export interface DriveConfiguration {
+  useDefaultCredentials?: boolean;
+  clientId?: string;
+  clientSecret?: string;
+  storageMode?: DriveStorageMode;
+  folderPath?: string;
+  versionHistoryMode?: VersionHistoryMode;
+  maxVersionFiles?: number;
+}
+
+export interface DriveVersion {
+  id: string;
+  modifiedTime: string;
+  size?: string | null;
+  name: string;
+  source: VersionHistoryMode;
+}
 
 /**
  * Connection status for UI
@@ -49,6 +79,11 @@ export class DriveService {
   // Stored credentials
   private clientId: string = '';
   private clientSecret: string = '';
+  private storageMode: DriveStorageMode = 'appDataFolder';
+  private folderPath: string = '/Tabby Sync/';
+  private folderId: string | null = null;
+  private versionHistoryMode: VersionHistoryMode = 'googleRevisions';
+  private maxVersionFiles = 20;
 
   /** Observable for connection status updates */
   private connectionStatus = new BehaviorSubject<DriveConnectionStatus>({
@@ -67,21 +102,37 @@ export class DriveService {
   ) {
     this.log = logService.create('GDriveSync:Drive');
 
-    // Auto-configure with hardcoded credentials
-    this.configure(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+    // Auto-configure with build-provided credentials and hidden AppData storage.
+    this.configure({});
   }
 
   /**
    * Configure OAuth credentials. Must be called before authorize().
    */
-  configure(clientId: string, clientSecret: string): void {
-    this.clientId = clientId;
-    this.clientSecret = clientSecret;
+  configure(configuration: DriveConfiguration): void {
+    const useDefaultCredentials = configuration.useDefaultCredentials !== false;
+    this.clientId = useDefaultCredentials
+      ? GOOGLE_CLIENT_ID
+      : configuration.clientId || '';
+    this.clientSecret = useDefaultCredentials
+      ? GOOGLE_CLIENT_SECRET
+      : configuration.clientSecret || '';
+    this.storageMode = configuration.storageMode || 'appDataFolder';
+    this.folderPath = this.normalizeFolderPath(
+      configuration.folderPath || '/Tabby Sync/',
+    );
+    this.versionHistoryMode =
+      configuration.versionHistoryMode || 'googleRevisions';
+    this.maxVersionFiles = this.normalizeMaxVersionFiles(
+      configuration.maxVersionFiles,
+    );
+    this.folderId = null;
+    this.syncFileId = null;
 
     // Reinitialize OAuth2 client with new credentials
     this.oauth2Client = new google.auth.OAuth2(
-      clientId,
-      clientSecret,
+      this.clientId,
+      this.clientSecret,
       REDIRECT_URI,
     );
 
@@ -91,7 +142,67 @@ export class DriveService {
       // Tokens will be saved by SyncService
     });
 
-    this.log.debug('OAuth credentials configured');
+    this.log.debug(
+      `OAuth credentials configured with storage mode ${this.storageMode}`,
+    );
+  }
+
+  /**
+   * Returns the configured remote storage mode.
+   */
+  getStorageMode(): DriveStorageMode {
+    return this.storageMode;
+  }
+
+  /**
+   * Updates the sync file location without changing OAuth credentials.
+   */
+  updateStorageTarget(
+    storageMode: DriveStorageMode,
+    folderPath: string,
+  ): void {
+    this.storageMode = storageMode;
+    this.folderPath = this.normalizeFolderPath(folderPath);
+    this.folderId = null;
+    this.syncFileId = null;
+    this.log.debug(`Drive storage target updated to ${this.storageMode}`);
+  }
+
+  /**
+   * Updates how historical versions are stored.
+   */
+  updateVersionHistory(
+    versionHistoryMode: VersionHistoryMode,
+    maxVersionFiles: number,
+  ): void {
+    this.versionHistoryMode = versionHistoryMode;
+    this.maxVersionFiles = this.normalizeMaxVersionFiles(maxVersionFiles);
+    this.syncFileId = null;
+  }
+
+  private normalizeMaxVersionFiles(maxVersionFiles?: number): number {
+    const normalized = Math.floor(Number(maxVersionFiles || 20));
+    if (!Number.isFinite(normalized) || normalized < 1) {
+      return 1;
+    }
+    return Math.min(normalized, 1000);
+  }
+
+  /**
+   * Normalizes a Drive folder path to /Folder/Subfolder/ format.
+   */
+  normalizeFolderPath(folderPath: string): string {
+    const parts = folderPath
+      .replace(/\\/g, '/')
+      .split('/')
+      .map((part) => part.trim())
+      .filter(Boolean);
+
+    if (parts.length === 0) {
+      return '/';
+    }
+
+    return `/${parts.join('/')}/`;
   }
 
   /**
@@ -173,7 +284,10 @@ export class DriveService {
       // Generate auth URL
       const authUrl = client.generateAuthUrl({
         access_type: 'offline', // Get refresh token
-        scope: SCOPES,
+        scope:
+          this.storageMode === 'driveFolder'
+            ? [DRIVE_FILE_SCOPE]
+            : [APP_DATA_SCOPE],
         prompt: 'consent', // Force consent screen to get refresh_token
       });
 
@@ -322,6 +436,7 @@ export class DriveService {
     }
     this.drive = null;
     this.syncFileId = null;
+    this.folderId = null;
 
     this.connectionStatus.next({
       connected: false,
@@ -330,8 +445,101 @@ export class DriveService {
     this.log.info('Disconnected from Google Drive');
   }
 
+  private escapeQueryValue(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  }
+
+  private createSnapshotFileName(): string {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    return `${SNAPSHOT_FILE_PREFIX}${timestamp}${SNAPSHOT_FILE_EXTENSION}`;
+  }
+
+  private isSnapshotFileName(name?: string | null): boolean {
+    return !!(
+      name &&
+      name.startsWith(SNAPSHOT_FILE_PREFIX) &&
+      name.endsWith(SNAPSHOT_FILE_EXTENSION)
+    );
+  }
+
+  private async ensureDriveFolder(): Promise<string> {
+    if (!this.drive) {
+      throw new Error('Drive client not initialized');
+    }
+
+    if (this.folderId) {
+      try {
+        await this.drive.files.get({
+          fileId: this.folderId,
+          fields: 'id',
+        });
+        return this.folderId;
+      } catch {
+        this.folderId = null;
+      }
+    }
+
+    const parts = this.normalizeFolderPath(this.folderPath)
+      .split('/')
+      .filter(Boolean);
+    let parentId = 'root';
+
+    for (const part of parts) {
+      const escapedName = this.escapeQueryValue(part);
+      const escapedParent = this.escapeQueryValue(parentId);
+      const response = await this.drive.files.list({
+        q:
+          `name = '${escapedName}' and ` +
+          'mimeType = \'application/vnd.google-apps.folder\' and ' +
+          `'${escapedParent}' in parents and trashed = false`,
+        fields: 'files(id, name)',
+        pageSize: 1,
+      });
+
+      const existingFolder = response.data.files?.[0];
+      if (existingFolder?.id) {
+        parentId = existingFolder.id;
+        continue;
+      }
+
+      const createResponse = await this.drive.files.create({
+        requestBody: {
+          name: part,
+          mimeType: 'application/vnd.google-apps.folder',
+          parents: [parentId],
+        },
+        fields: 'id',
+      });
+
+      if (!createResponse.data.id) {
+        throw new Error(`Failed to create Drive folder: ${part}`);
+      }
+
+      parentId = createResponse.data.id;
+    }
+
+    this.folderId = parentId;
+    return parentId;
+  }
+
+  private async getSyncParent(): Promise<{
+    spaces?: string;
+    parents: string[];
+  }> {
+    if (this.storageMode === 'driveFolder') {
+      return {
+        parents: [await this.ensureDriveFolder()],
+      };
+    }
+
+    return {
+      spaces: 'appDataFolder',
+      parents: ['appDataFolder'],
+    };
+  }
+
   /**
-   * Finds the sync file in AppData folder.
+   * Finds the sync file in configured storage.
    *
    * @returns File ID or null if not found
    */
@@ -340,8 +548,13 @@ export class DriveService {
       throw new Error('Drive client not initialized');
     }
 
-    // Check cache first
-    if (this.syncFileId) {
+    if (this.versionHistoryMode === 'timestampedFiles') {
+      const latestSnapshot = await this.findLatestSnapshotFile();
+      if (latestSnapshot?.id) {
+        this.syncFileId = latestSnapshot.id;
+        return latestSnapshot.id;
+      }
+    } else if (this.syncFileId) {
       // Verify file still exists
       try {
         await this.drive.files.get({
@@ -354,10 +567,19 @@ export class DriveService {
       }
     }
 
+    const syncParent = await this.getSyncParent();
+    const escapedFileName = this.escapeQueryValue(SYNC_FILE_NAME);
+    const q =
+      this.storageMode === 'driveFolder'
+        ? `name = '${escapedFileName}' and ` +
+          `'${this.escapeQueryValue(syncParent.parents[0])}' in parents and ` +
+          'trashed = false'
+        : `name = '${escapedFileName}' and trashed = false`;
+
     // Search for the file
     const response = await this.drive.files.list({
-      spaces: 'appDataFolder',
-      q: `name = '${SYNC_FILE_NAME}'`,
+      spaces: syncParent.spaces,
+      q,
       fields: 'files(id, name, modifiedTime)',
       pageSize: 1,
     });
@@ -368,6 +590,41 @@ export class DriveService {
     }
 
     return null;
+  }
+
+  private async listSnapshotFiles(): Promise<drive_v3.Schema$File[]> {
+    if (!this.drive) {
+      throw new Error('Drive client not initialized');
+    }
+
+    const syncParent = await this.getSyncParent();
+    const escapedParent = this.escapeQueryValue(syncParent.parents[0]);
+    const q =
+      this.storageMode === 'driveFolder'
+        ? `name contains '${SNAPSHOT_FILE_PREFIX}' and ` +
+          `'${escapedParent}' in parents and trashed = false`
+        : `name contains '${SNAPSHOT_FILE_PREFIX}' and trashed = false`;
+
+    const response = await this.drive.files.list({
+      spaces: syncParent.spaces,
+      q,
+      fields: 'files(id, name, modifiedTime, size)',
+      orderBy: 'modifiedTime desc',
+      pageSize: 1000,
+    });
+
+    return (response.data.files || [])
+      .filter((file) => this.isSnapshotFileName(file.name))
+      .sort(
+        (a, b) =>
+          new Date(b.modifiedTime || 0).getTime() -
+          new Date(a.modifiedTime || 0).getTime(),
+      );
+  }
+
+  private async findLatestSnapshotFile(): Promise<drive_v3.Schema$File | null> {
+    const snapshots = await this.listSnapshotFiles();
+    return snapshots[0] || null;
   }
 
   /**
@@ -417,8 +674,6 @@ export class DriveService {
       throw new Error('Drive client not initialized');
     }
 
-    const fileId = await this.findSyncFile();
-
     const media = {
       mimeType: 'application/json',
       body: content,
@@ -426,31 +681,76 @@ export class DriveService {
 
     let response: { data: drive_v3.Schema$File };
 
-    if (fileId) {
-      // Update existing file
-      this.log.debug('Updating existing sync file');
-      response = await this.drive.files.update({
-        fileId,
-        media,
-        fields: 'id',
-      });
-    } else {
-      // Create new file
-      this.log.debug('Creating new sync file');
+    if (this.versionHistoryMode === 'timestampedFiles') {
+      const syncParent = await this.getSyncParent();
+
+      this.log.debug('Creating new timestamped sync snapshot');
       response = await this.drive.files.create({
         requestBody: {
-          name: SYNC_FILE_NAME,
-          parents: ['appDataFolder'],
+          name: this.createSnapshotFileName(),
+          parents: syncParent.parents,
         },
         media,
         fields: 'id',
       });
-    }
+      this.syncFileId = response.data.id || null;
+      await this.cleanupOldSnapshotFiles();
+    } else {
+      const fileId = await this.findSyncFile();
 
-    this.syncFileId = response.data.id || null;
+      if (fileId) {
+        // Update existing file
+        this.log.debug('Updating existing sync file');
+        response = await this.drive.files.update({
+          fileId,
+          media,
+          fields: 'id',
+        });
+      } else {
+        const syncParent = await this.getSyncParent();
+
+        // Create new file
+        this.log.debug('Creating new sync file');
+        response = await this.drive.files.create({
+          requestBody: {
+            name: SYNC_FILE_NAME,
+            parents: syncParent.parents,
+          },
+          media,
+          fields: 'id',
+        });
+      }
+
+      this.syncFileId = response.data.id || null;
+    }
     this.log.info('Sync file uploaded successfully');
 
     return this.syncFileId || '';
+  }
+
+  private async cleanupOldSnapshotFiles(): Promise<void> {
+    const snapshots = await this.listSnapshotFiles();
+    const extraFiles = snapshots.slice(this.maxVersionFiles);
+
+    for (const file of extraFiles) {
+      if (!file.id) {
+        continue;
+      }
+
+      try {
+        if (this.storageMode === 'driveFolder') {
+          await this.drive?.files.update({
+            fileId: file.id,
+            requestBody: { trashed: true },
+            fields: 'id',
+          });
+        } else {
+          await this.drive?.files.delete({ fileId: file.id });
+        }
+      } catch (error) {
+        this.log.warn(`Failed to clean up old snapshot ${file.id}:`, error);
+      }
+    }
   }
 
   /**
@@ -507,9 +807,22 @@ export class DriveService {
   /**
    * Lists available versions of the sync file.
    */
-  async listVersions(): Promise<drive_v3.Schema$Revision[]> {
+  async listVersions(): Promise<DriveVersion[]> {
     if (!this.drive) {
       throw new Error('Drive client not initialized');
+    }
+
+    if (this.versionHistoryMode === 'timestampedFiles') {
+      const snapshots = await this.listSnapshotFiles();
+      return snapshots
+        .filter((file) => file.id && file.modifiedTime)
+        .map((file) => ({
+          id: file.id as string,
+          modifiedTime: file.modifiedTime as string,
+          size: file.size,
+          name: file.name || 'Sync snapshot',
+          source: 'timestampedFiles',
+        }));
     }
 
     const fileId = await this.findSyncFile();
@@ -523,7 +836,17 @@ export class DriveService {
         fields: 'revisions(id, modifiedTime, size)',
         pageSize: 100,
       });
-      return response.data.revisions || [];
+      return (response.data.revisions || [])
+        .filter((revision) => revision.id && revision.modifiedTime)
+        .map((revision) => ({
+          id: revision.id as string,
+          modifiedTime: revision.modifiedTime as string,
+          size: revision.size,
+          name: `Version ${new Date(
+            revision.modifiedTime as string,
+          ).toLocaleString()}`,
+          source: 'googleRevisions',
+        }));
     } catch (error) {
       this.log.error('Failed to list versions:', error);
       throw error;
@@ -536,6 +859,24 @@ export class DriveService {
   async downloadVersion(revisionId: string): Promise<string | null> {
     if (!this.drive) {
       throw new Error('Drive client not initialized');
+    }
+
+    if (this.versionHistoryMode === 'timestampedFiles') {
+      try {
+        const response = await this.drive.files.get(
+          {
+            fileId: revisionId,
+            alt: 'media',
+          },
+          {
+            responseType: 'text',
+          },
+        );
+        return response.data as string;
+      } catch (error) {
+        this.log.error(`Failed to download snapshot ${revisionId}:`, error);
+        throw error;
+      }
     }
 
     const fileId = await this.findSyncFile();

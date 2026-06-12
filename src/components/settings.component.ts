@@ -11,8 +11,14 @@
 import { Component, OnInit, OnDestroy } from '@angular/core';
 import { Subscription, Observable } from 'rxjs';
 import { SyncService, SyncState } from '../services/sync.service';
-import { DriveConnectionStatus } from '../services/drive.service';
-import { SyncVersion } from '../interfaces/sync.interface';
+import {
+  DriveConnectionStatus,
+  DriveStorageMode,
+} from '../services/drive.service';
+import {
+  SyncVersion,
+  VersionHistoryMode,
+} from '../interfaces/sync.interface';
 
 @Component({
   selector: 'gdrive-sync-settings',
@@ -40,36 +46,124 @@ import { SyncVersion } from '../interfaces/sync.interface';
         </div>
       </div>
 
-      <!-- Connection Status -->
-      <div class="status-section">
-        <div
-          class="status-indicator"
-          [class.connected]="driveStatus?.connected"
-          [class.error]="syncState?.status === 'error'"
-        >
-          <i
-            class="fas"
-            [class.fa-check-circle]="driveStatus?.connected"
-            [class.fa-times-circle]="!driveStatus?.connected"
-          ></i>
-          <span *ngIf="driveStatus?.connected">
-            Connected as {{ driveStatus?.email }}
-          </span>
-          <span *ngIf="!driveStatus?.connected"> Not connected </span>
-        </div>
+      <!-- Google Drive Account -->
+      <div class="settings-section">
+        <h4>
+          <i class="fab fa-google-drive"></i>
+          Google Drive Account
+        </h4>
+        <div class="status-section">
+          <div
+            class="status-indicator"
+            [class.connected]="driveStatus?.connected"
+            [class.error]="syncState?.status === 'error'"
+          >
+            <i
+              class="fas"
+              [class.fa-check-circle]="driveStatus?.connected"
+              [class.fa-times-circle]="!driveStatus?.connected"
+            ></i>
+            <span *ngIf="driveStatus?.connected">
+              Connected as {{ driveStatus?.email }}
+            </span>
+            <span *ngIf="!driveStatus?.connected"> Not connected </span>
+          </div>
 
-        <div class="sync-status" *ngIf="driveStatus?.connected">
-          <span *ngIf="syncState?.status === 'syncing'">
-            <i class="fas fa-sync fa-spin"></i> Syncing...
-          </span>
-          <span *ngIf="syncState?.status === 'idle' && syncState?.lastSyncTime">
-            <i class="fas fa-clock"></i> Last sync:
-            {{ formatTime(syncState.lastSyncTime) }}
-          </span>
-          <span *ngIf="syncState?.status === 'error'" class="error-text">
-            <i class="fas fa-exclamation-triangle"></i> Error:
-            {{ syncState?.lastSyncError }}
-          </span>
+          <div class="sync-status" *ngIf="driveStatus?.connected">
+            <span *ngIf="syncState?.status === 'syncing'">
+              <i class="fas fa-sync fa-spin"></i> Syncing...
+            </span>
+            <span
+              *ngIf="syncState?.status === 'idle' && syncState?.lastSyncTime"
+            >
+              <i class="fas fa-clock"></i> Last sync:
+              {{ formatTime(syncState.lastSyncTime) }}
+            </span>
+            <span *ngIf="syncState?.status === 'error'" class="error-text">
+              <i class="fas fa-exclamation-triangle"></i> Error:
+              {{ syncState?.lastSyncError }}
+            </span>
+          </div>
+        </div>
+        <div class="help-text">
+          Built-in credentials are used by default when the build provides
+          them. Use custom credentials to depend on your own Google Cloud OAuth
+          app.
+        </div>
+        <div class="setting-row">
+          <label>
+            <input
+              type="checkbox"
+              [(ngModel)]="useCustomGoogleCredentials"
+            />
+            Use custom Google credentials
+          </label>
+        </div>
+        <div *ngIf="useCustomGoogleCredentials">
+          <div class="input-group">
+            <label for="gdrive-client-id">Google Client ID</label>
+            <input
+              id="gdrive-client-id"
+              class="form-control"
+              type="text"
+              [(ngModel)]="googleClientId"
+            />
+          </div>
+          <div class="input-group">
+            <label for="gdrive-client-secret">Google Client Secret</label>
+            <input
+              id="gdrive-client-secret"
+              class="form-control"
+              type="password"
+              autocomplete="new-password"
+              [(ngModel)]="googleClientSecret"
+            />
+            <div class="help-text" *ngIf="hasSavedGoogleClientSecret">
+              Leave empty to keep the saved secret.
+            </div>
+          </div>
+        </div>
+        <button
+          class="btn btn-secondary"
+          [class.save-needed]="googleCredentialsDirty"
+          (click)="saveGoogleCredentialsSettings()"
+          [disabled]="isSavingGoogleSettings"
+        >
+          <i class="fas fa-save"></i>
+          Save OAuth settings
+        </button>
+        <div class="password-ok" *ngIf="googleSettingsMessage">
+          <i class="fas fa-check-circle"></i> {{ googleSettingsMessage }}
+        </div>
+        <div class="password-error" *ngIf="googleSettingsError">
+          <i class="fas fa-exclamation-triangle"></i> {{ googleSettingsError }}
+        </div>
+        <div
+          class="alert alert-warning mt-2"
+          *ngIf="driveStatus?.connected && googleCredentialsResetPending"
+        >
+          Saving these OAuth settings will disconnect Google Drive. Connect
+          again after saving.
+        </div>
+        <div class="button-row account-actions">
+          <button
+            *ngIf="!driveStatus?.connected"
+            class="btn btn-primary"
+            (click)="connectGoogleDrive()"
+            [disabled]="isConnecting"
+          >
+            <i class="fab fa-google-drive"></i>
+            {{ isConnecting ? 'Connecting...' : 'Connect Google Drive' }}
+          </button>
+          <div *ngIf="driveStatus?.connected" class="connected-actions">
+            <button class="btn btn-warning" (click)="disconnectGoogleDrive()">
+              <i class="fas fa-unlink"></i>
+              Disconnect
+            </button>
+          </div>
+        </div>
+        <div *ngIf="driveStatus?.connected" class="status-msg">
+          <i class="fas fa-shield-alt"></i> Data encrypted with AES-256.
         </div>
       </div>
 
@@ -81,7 +175,8 @@ import { SyncVersion } from '../interfaces/sync.interface';
         </h4>
         <div class="help-text">
           Use the same password on every machine. The password itself is not
-          stored; only a local verification hash is saved.
+          stored; only a local verification hash is saved. After restarting
+          Tabby, unlock it again to sync or restore old versions.
         </div>
         <div class="password-input-row">
           <input
@@ -98,7 +193,7 @@ import { SyncVersion } from '../interfaces/sync.interface';
             [disabled]="isSavingPassword || !masterPasswordInput"
           >
             <i class="fas fa-unlock"></i>
-            Unlock
+            Unlock for this session
           </button>
         </div>
         <div class="password-actions">
@@ -119,6 +214,139 @@ import { SyncVersion } from '../interfaces/sync.interface';
         </div>
         <div class="password-error" *ngIf="passwordError">
           <i class="fas fa-exclamation-triangle"></i> {{ passwordError }}
+        </div>
+      </div>
+
+      <!-- Drive Storage -->
+      <div class="settings-section">
+        <h4>
+          <i class="fas fa-folder"></i>
+          Drive Storage
+        </h4>
+        <div class="help-text">
+          Hidden app folder uses limited app data access. Visible Drive folder
+          asks Google for file access and creates the configured folder path.
+        </div>
+        <div class="setting-row">
+          <label>
+            <input
+              type="radio"
+              name="driveStorageMode"
+              value="appDataFolder"
+              [(ngModel)]="driveStorageMode"
+            />
+            Hidden app folder
+          </label>
+        </div>
+        <div class="setting-row">
+          <label>
+            <input
+              type="radio"
+              name="driveStorageMode"
+              value="driveFolder"
+              [(ngModel)]="driveStorageMode"
+            />
+            Visible Drive folder
+          </label>
+        </div>
+        <div class="input-group" *ngIf="driveStorageMode === 'driveFolder'">
+          <label for="gdrive-folder-path">Drive folder path</label>
+          <input
+            id="gdrive-folder-path"
+            class="form-control"
+            type="text"
+            placeholder="/Tabby Sync/"
+            [(ngModel)]="driveFolderPath"
+            (blur)="normalizeDriveFolderPath()"
+          />
+        </div>
+        <button
+          class="btn btn-secondary"
+          [class.save-needed]="storageSettingsDirty"
+          (click)="saveDriveStorageSettings()"
+          [disabled]="isSavingStorageSettings"
+        >
+          <i class="fas fa-save"></i>
+          Save storage settings
+        </button>
+        <div class="password-ok" *ngIf="storageSettingsMessage">
+          <i class="fas fa-check-circle"></i> {{ storageSettingsMessage }}
+        </div>
+        <div class="password-error" *ngIf="storageSettingsError">
+          <i class="fas fa-exclamation-triangle"></i> {{ storageSettingsError }}
+        </div>
+        <div
+          class="alert alert-warning mt-2"
+          *ngIf="driveStatus?.connected && storageResetPending"
+        >
+          Changing storage type will disconnect Google Drive. Connect again
+          after saving to grant the matching permissions.
+        </div>
+      </div>
+
+      <!-- Version History Storage -->
+      <div class="settings-section">
+        <h4>
+          <i class="fas fa-history"></i>
+          Version History
+        </h4>
+        <div class="setting-row">
+          <label>
+            <input
+              type="radio"
+              name="versionHistoryMode"
+              value="googleRevisions"
+              [(ngModel)]="versionHistoryMode"
+            />
+            Google Drive file history
+          </label>
+          <div class="help-text option-help">
+            Uses Google revisions for one sync file. Google usually keeps
+            revisions for about 30 days or the latest 100 versions.
+          </div>
+        </div>
+        <div class="setting-row">
+          <label>
+            <input
+              type="radio"
+              name="versionHistoryMode"
+              value="timestampedFiles"
+              [(ngModel)]="versionHistoryMode"
+            />
+            Separate timestamped files
+          </label>
+          <div class="help-text option-help">
+            Creates files with different names. Older visible Drive files are
+            moved to Trash when the limit is exceeded.
+          </div>
+        </div>
+        <div class="input-group" *ngIf="versionHistoryMode === 'timestampedFiles'">
+          <label for="gdrive-max-version-files">Maximum files to keep</label>
+          <input
+            id="gdrive-max-version-files"
+            class="form-control compact-number-input"
+            type="number"
+            min="1"
+            max="1000"
+            step="1"
+            [(ngModel)]="maxVersionFiles"
+          />
+        </div>
+        <button
+          class="btn btn-secondary"
+          [class.save-needed]="versionSettingsDirty"
+          (click)="saveVersionHistorySettings()"
+          [disabled]="isSavingVersionSettings"
+        >
+          <i class="fas fa-save"></i>
+          Save version settings
+        </button>
+        <div class="password-ok" *ngIf="versionSettingsMessage">
+          <i class="fas fa-check-circle"></i> {{ versionSettingsMessage }}
+        </div>
+        <div class="password-error" *ngIf="versionSettingsError">
+          <i class="fas fa-exclamation-triangle"></i>
+          {{ versionSettingsError }}
         </div>
       </div>
 
@@ -143,6 +371,7 @@ import { SyncVersion } from '../interfaces/sync.interface';
             <span class="input-suffix">minutes</span>
             <button
               class="btn btn-secondary"
+              [class.save-needed]="syncIntervalDirty"
               (click)="saveSyncInterval()"
               [disabled]="isSavingSettings"
             >
@@ -157,31 +386,6 @@ import { SyncVersion } from '../interfaces/sync.interface';
         <div class="password-error" *ngIf="settingsError">
           <i class="fas fa-exclamation-triangle"></i> {{ settingsError }}
         </div>
-      </div>
-
-      <!-- Google Drive Connection -->
-      <div class="button-row">
-        <button
-          *ngIf="!driveStatus?.connected"
-          class="btn btn-primary"
-          (click)="connectGoogleDrive()"
-          [disabled]="isConnecting"
-        >
-          <i class="fab fa-google-drive"></i>
-          {{ isConnecting ? 'Connecting...' : 'Connect Google Drive' }}
-        </button>
-        <div *ngIf="driveStatus?.connected" class="connected-actions">
-          <button class="btn btn-warning" (click)="disconnectGoogleDrive()">
-            <i class="fas fa-unlink"></i>
-            Disconnect
-          </button>
-        </div>
-      </div>
-
-      <!-- Status message when connected -->
-      <div *ngIf="driveStatus?.connected" class="status-msg">
-        <i class="fas fa-shield-alt"></i> Data encrypted with AES-256. Auto-sync
-        active.
       </div>
 
       <!-- Version History (Time Machine) -->
@@ -204,6 +408,11 @@ import { SyncVersion } from '../interfaces/sync.interface';
             <i class="fas fa-sync" [class.fa-spin]="loadingVersions"></i>
             Refresh Versions
           </button>
+
+          <div class="password-error" *ngIf="versionRestoreError">
+            <i class="fas fa-exclamation-triangle"></i>
+            {{ versionRestoreError }}
+          </div>
 
           <div
             *ngIf="versions.length === 0 && !loadingVersions"
@@ -309,6 +518,13 @@ import { SyncVersion } from '../interfaces/sync.interface';
         cursor: pointer;
       }
 
+      .setting-row input[type='checkbox'],
+      .setting-row input[type='radio'] {
+        width: 16px;
+        height: 16px;
+        accent-color: var(--theme-primary);
+      }
+
       .button-row {
         display: flex;
         gap: 10px;
@@ -325,7 +541,11 @@ import { SyncVersion } from '../interfaces/sync.interface';
         border: none;
         cursor: pointer;
         font-size: 0.9rem;
-        transition: opacity 0.2s;
+        transition:
+          background-color 0.2s,
+          color 0.2s,
+          box-shadow 0.2s,
+          opacity 0.2s;
       }
 
       .btn:disabled {
@@ -341,6 +561,12 @@ import { SyncVersion } from '../interfaces/sync.interface';
       .btn-secondary {
         background: var(--bs-secondary);
         color: white;
+      }
+
+      .btn.save-needed:not(:disabled) {
+        background: #111827;
+        color: white;
+        box-shadow: 0 0 0 2px rgba(17, 24, 39, 0.18);
       }
 
       .btn-success {
@@ -384,6 +610,10 @@ import { SyncVersion } from '../interfaces/sync.interface';
         margin-bottom: 10px;
       }
 
+      .option-help {
+        margin: 4px 0 12px 24px;
+      }
+
       .password-input-row {
         display: flex;
         gap: 8px;
@@ -394,10 +624,14 @@ import { SyncVersion } from '../interfaces/sync.interface';
         display: flex;
         align-items: center;
         gap: 8px;
+        flex-wrap: wrap;
       }
 
       .interval-input {
-        max-width: 120px;
+        flex: 0 0 96px;
+        width: 96px;
+        max-width: 96px;
+        text-align: center;
       }
 
       .input-suffix {
@@ -407,11 +641,33 @@ import { SyncVersion } from '../interfaces/sync.interface';
 
       .form-control {
         flex: 1;
+        box-sizing: border-box;
         padding: 8px 12px;
         border-radius: 6px;
-        border: 1px solid var(--bs-border-color);
-        background: var(--bs-dark);
+        border: 1px solid rgba(120, 120, 120, 0.55);
+        background: rgba(120, 120, 120, 0.12);
         color: var(--body-color);
+        min-height: 38px;
+        box-shadow: inset 0 0 0 1px rgba(120, 120, 120, 0.08);
+      }
+
+      .form-control:focus {
+        border-color: var(--theme-primary);
+        outline: none;
+        box-shadow: 0 0 0 2px rgba(66, 133, 244, 0.2);
+      }
+
+      .interval-input-row .interval-input {
+        flex: 0 0 96px;
+        width: 96px;
+        max-width: 96px;
+        text-align: center;
+      }
+
+      .compact-number-input {
+        flex: 0 0 120px;
+        width: 120px;
+        max-width: 120px;
       }
 
       .password-actions {
@@ -445,7 +701,9 @@ import { SyncVersion } from '../interfaces/sync.interface';
       }
 
       .input-group {
+        display: block;
         margin-bottom: 15px;
+        width: 100%;
       }
 
       .input-group label {
@@ -457,6 +715,7 @@ import { SyncVersion } from '../interfaces/sync.interface';
 
       .input-group .form-control {
         width: 100%;
+        max-width: 100%;
       }
 
       .reset-section {
@@ -568,18 +827,43 @@ export class SettingsComponent implements OnInit, OnDestroy {
   isConnecting = false;
   isSavingPassword = false;
   isSavingSettings = false;
+  isSavingGoogleSettings = false;
+  isSavingStorageSettings = false;
+  isSavingVersionSettings = false;
   masterPasswordInput = '';
   passwordError = '';
   passwordMessage = '';
   passwordConfigured = false;
   syncIntervalMinutes = 60;
+  savedSyncIntervalMinutes = 60;
   settingsError = '';
   settingsMessage = '';
+  useCustomGoogleCredentials = false;
+  googleClientId = '';
+  googleClientSecret = '';
+  hasSavedGoogleClientSecret = false;
+  savedUseCustomGoogleCredentials = false;
+  savedGoogleClientId = '';
+  googleSettingsError = '';
+  googleSettingsMessage = '';
+  driveStorageMode: DriveStorageMode = 'appDataFolder';
+  driveFolderPath = '/Tabby Sync/';
+  savedDriveStorageMode: DriveStorageMode = 'appDataFolder';
+  savedDriveFolderPath = '/Tabby Sync/';
+  storageSettingsError = '';
+  storageSettingsMessage = '';
+  versionHistoryMode: VersionHistoryMode = 'googleRevisions';
+  maxVersionFiles = 20;
+  savedVersionHistoryMode: VersionHistoryMode = 'googleRevisions';
+  savedMaxVersionFiles = 20;
+  versionSettingsError = '';
+  versionSettingsMessage = '';
 
   // Version History
   versions: SyncVersion[] = [];
   loadingVersions = false;
   showVersions = false;
+  versionRestoreError = '';
 
   private subscriptions: Subscription[] = [];
 
@@ -589,9 +873,78 @@ export class SettingsComponent implements OnInit, OnDestroy {
     return this.sync.missingPlugins$;
   }
 
+  get googleCredentialsResetPending(): boolean {
+    if (
+      this.savedUseCustomGoogleCredentials !==
+      this.useCustomGoogleCredentials
+    ) {
+      return true;
+    }
+
+    if (!this.useCustomGoogleCredentials) {
+      return false;
+    }
+
+    return (
+      this.savedGoogleClientId !== this.googleClientId.trim() ||
+      !!this.googleClientSecret.trim()
+    );
+  }
+
+  get googleCredentialsDirty(): boolean {
+    return this.googleCredentialsResetPending;
+  }
+
+  get storageResetPending(): boolean {
+    return this.savedDriveStorageMode !== this.driveStorageMode;
+  }
+
+  get storageSettingsDirty(): boolean {
+    return (
+      this.savedDriveStorageMode !== this.driveStorageMode ||
+      this.savedDriveFolderPath !==
+        this.sync.normalizeDriveFolderPath(this.driveFolderPath || '/Tabby Sync/')
+    );
+  }
+
+  get versionSettingsDirty(): boolean {
+    return (
+      this.savedVersionHistoryMode !== this.versionHistoryMode ||
+      (this.versionHistoryMode === 'timestampedFiles' &&
+        Number(this.maxVersionFiles) !== this.savedMaxVersionFiles)
+    );
+  }
+
+  get syncIntervalDirty(): boolean {
+    return Number(this.syncIntervalMinutes) !== this.savedSyncIntervalMinutes;
+  }
+
   ngOnInit(): void {
     this.passwordConfigured = this.sync.isPasswordConfigured();
     this.syncIntervalMinutes = this.sync.getSyncIntervalMinutes();
+    this.savedSyncIntervalMinutes = this.syncIntervalMinutes;
+    const googleSettings = this.sync.getGoogleCredentialsSettings();
+    this.useCustomGoogleCredentials =
+      googleSettings.useCustomGoogleCredentials;
+    this.googleClientId = googleSettings.googleClientId;
+    this.googleClientSecret = googleSettings.googleClientSecret;
+    this.hasSavedGoogleClientSecret =
+      googleSettings.hasSavedGoogleClientSecret;
+    this.savedUseCustomGoogleCredentials =
+      googleSettings.useCustomGoogleCredentials;
+    this.savedGoogleClientId = googleSettings.googleClientId;
+
+    const storageSettings = this.sync.getDriveStorageSettings();
+    this.driveStorageMode = storageSettings.driveStorageMode;
+    this.driveFolderPath = storageSettings.driveFolderPath;
+    this.savedDriveStorageMode = storageSettings.driveStorageMode;
+    this.savedDriveFolderPath = storageSettings.driveFolderPath;
+
+    const versionSettings = this.sync.getVersionHistorySettings();
+    this.versionHistoryMode = versionSettings.versionHistoryMode;
+    this.maxVersionFiles = versionSettings.maxVersionFiles;
+    this.savedVersionHistoryMode = versionSettings.versionHistoryMode;
+    this.savedMaxVersionFiles = versionSettings.maxVersionFiles;
 
     // Subscribe to drive status
     this.subscriptions.push(
@@ -633,7 +986,8 @@ export class SettingsComponent implements OnInit, OnDestroy {
       }
 
       this.passwordConfigured = true;
-      this.passwordMessage = 'Sync password unlocked';
+      this.passwordMessage = 'Sync password unlocked for this Tabby session';
+      this.versionRestoreError = '';
       this.masterPasswordInput = '';
 
       if (this.driveStatus?.connected) {
@@ -692,6 +1046,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
     try {
       await this.sync.setSyncIntervalMinutes(minutes);
       this.syncIntervalMinutes = this.sync.getSyncIntervalMinutes();
+      this.savedSyncIntervalMinutes = this.syncIntervalMinutes;
       this.settingsMessage = 'Sync interval saved';
     } catch (error) {
       this.settingsError =
@@ -701,9 +1056,119 @@ export class SettingsComponent implements OnInit, OnDestroy {
     }
   }
 
+  async saveGoogleCredentialsSettings(): Promise<void> {
+    if (
+      this.driveStatus?.connected &&
+      this.googleCredentialsResetPending &&
+      !window.confirm(
+        'Changing Google OAuth settings will disconnect Google Drive. ' +
+          'You will need to connect again. Continue?',
+      )
+    ) {
+      return;
+    }
+
+    this.isSavingGoogleSettings = true;
+    this.googleSettingsError = '';
+    this.googleSettingsMessage = '';
+    try {
+      const result = await this.sync.setGoogleCredentialsSettings({
+        useCustomGoogleCredentials: this.useCustomGoogleCredentials,
+        googleClientId: this.googleClientId,
+        googleClientSecret: this.googleClientSecret,
+      });
+      const googleSettings = this.sync.getGoogleCredentialsSettings();
+      this.useCustomGoogleCredentials =
+        googleSettings.useCustomGoogleCredentials;
+      this.googleClientId = googleSettings.googleClientId;
+      this.googleClientSecret = '';
+      this.hasSavedGoogleClientSecret =
+        googleSettings.hasSavedGoogleClientSecret;
+      this.savedUseCustomGoogleCredentials =
+        googleSettings.useCustomGoogleCredentials;
+      this.savedGoogleClientId = googleSettings.googleClientId;
+      this.googleSettingsMessage = result.reconnectRequired
+        ? 'OAuth settings saved. Connect Google Drive again to apply them.'
+        : 'OAuth settings saved.';
+    } catch (error) {
+      this.googleSettingsError =
+        'Failed to save OAuth settings: ' + (error as Error).message;
+    } finally {
+      this.isSavingGoogleSettings = false;
+    }
+  }
+
+  normalizeDriveFolderPath(): void {
+    this.driveFolderPath = this.sync.normalizeDriveFolderPath(
+      this.driveFolderPath,
+    );
+  }
+
+  async saveDriveStorageSettings(): Promise<void> {
+    if (
+      this.driveStatus?.connected &&
+      this.storageResetPending &&
+      !window.confirm(
+        'Changing Drive storage type will disconnect Google Drive. ' +
+          'You will need to connect again with the new permissions. Continue?',
+      )
+    ) {
+      return;
+    }
+
+    this.isSavingStorageSettings = true;
+    this.storageSettingsError = '';
+    this.storageSettingsMessage = '';
+    try {
+      this.normalizeDriveFolderPath();
+      const result = await this.sync.setDriveStorageSettings({
+        driveStorageMode: this.driveStorageMode,
+        driveFolderPath: this.driveFolderPath,
+      });
+      const storageSettings = this.sync.getDriveStorageSettings();
+      this.driveStorageMode = storageSettings.driveStorageMode;
+      this.driveFolderPath = storageSettings.driveFolderPath;
+      this.savedDriveStorageMode = storageSettings.driveStorageMode;
+      this.savedDriveFolderPath = storageSettings.driveFolderPath;
+      this.storageSettingsMessage = result.reconnectRequired
+        ? 'Storage settings saved. Connect Google Drive again to apply them.'
+        : 'Storage settings saved.';
+    } catch (error) {
+      this.storageSettingsError =
+        'Failed to save storage settings: ' + (error as Error).message;
+    } finally {
+      this.isSavingStorageSettings = false;
+    }
+  }
+
+  async saveVersionHistorySettings(): Promise<void> {
+    this.isSavingVersionSettings = true;
+    this.versionSettingsError = '';
+    this.versionSettingsMessage = '';
+    try {
+      await this.sync.setVersionHistorySettings({
+        versionHistoryMode: this.versionHistoryMode,
+        maxVersionFiles: this.maxVersionFiles,
+      });
+      const versionSettings = this.sync.getVersionHistorySettings();
+      this.versionHistoryMode = versionSettings.versionHistoryMode;
+      this.maxVersionFiles = versionSettings.maxVersionFiles;
+      this.savedVersionHistoryMode = versionSettings.versionHistoryMode;
+      this.savedMaxVersionFiles = versionSettings.maxVersionFiles;
+      this.versions = [];
+      this.versionSettingsMessage = 'Version settings saved.';
+    } catch (error) {
+      this.versionSettingsError =
+        'Failed to save version settings: ' + (error as Error).message;
+    } finally {
+      this.isSavingVersionSettings = false;
+    }
+  }
+
   async connectGoogleDrive(): Promise<void> {
-    if (!this.sync.hasPassword()) {
-      this.passwordError = 'Set or unlock sync password first';
+    if (!this.sync.hasGoogleCredentials()) {
+      this.googleSettingsError =
+        'Save Google Client ID and Client Secret first';
       return;
     }
 
@@ -711,9 +1176,14 @@ export class SettingsComponent implements OnInit, OnDestroy {
     try {
       const success = await this.sync.connectGoogleDrive();
       if (success) {
-        await this.sync.setEnabled(true);
-        // Trigger initial sync
-        this.sync.fullSync();
+        if (this.sync.hasPassword()) {
+          await this.sync.setEnabled(true);
+          // Trigger initial sync
+          this.sync.fullSync();
+        } else {
+          this.passwordMessage =
+            'Google Drive connected. Set or unlock sync password next.';
+        }
       }
     } finally {
       this.isConnecting = false;
@@ -747,6 +1217,13 @@ export class SettingsComponent implements OnInit, OnDestroy {
   }
 
   async restoreVersion(id: string): Promise<void> {
+    this.versionRestoreError = '';
+    if (!this.sync.hasPassword()) {
+      this.versionRestoreError =
+        'Enter Sync Password above and click "Unlock for this session" before restoring versions.';
+      return;
+    }
+
     if (
       !confirm(
         'Are you sure you want to restore this version? Current settings will be overwritten.',

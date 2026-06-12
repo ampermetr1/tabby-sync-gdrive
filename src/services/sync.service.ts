@@ -34,7 +34,11 @@ import { Subscription, BehaviorSubject, Observable } from 'rxjs';
 import { debounceTime, filter } from 'rxjs/operators';
 
 import { CryptoService, EncryptedData } from './crypto.service';
-import { DriveService, DriveConnectionStatus } from './drive.service';
+import {
+  DriveService,
+  DriveConnectionStatus,
+  DriveStorageMode,
+} from './drive.service';
 import { createSyncPayload } from '../utils/sanitize.util';
 import { mergePayloads, applyPayloadToConfig } from '../utils/merge.util';
 import {
@@ -44,11 +48,13 @@ import {
   QuickCommand,
   QuickCommandGroup,
   SyncVersion,
+  VersionHistoryMode,
 } from '../interfaces/sync.interface';
 import * as yaml from 'js-yaml';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
+import { safeStorage as electronSafeStorage } from 'electron';
 
 /** Retry configuration */
 const MAX_RETRIES = 3;
@@ -56,6 +62,8 @@ const INITIAL_RETRY_DELAY_MS = 1000;
 const SYNC_DEBOUNCE_MS = 5000; // Wait 5 seconds after last change before scheduling sync
 const DEFAULT_SYNC_INTERVAL_MINUTES = 60;
 const MIN_SYNC_INTERVAL_MINUTES = 1;
+const SAFE_STORAGE_SECRET_PREFIX = 'electron-safe-storage:v1:';
+const DEFAULT_MAX_VERSION_FILES = 20;
 
 /**
  * Current sync state for UI
@@ -71,6 +79,16 @@ export interface PasswordChangeResult {
   savedLocal: boolean;
   remoteSynced: boolean;
   error?: string;
+}
+
+export interface SettingsSaveResult {
+  reconnectRequired: boolean;
+}
+
+interface ElectronSafeStorage {
+  isEncryptionAvailable(): boolean;
+  encryptString(value: string): Buffer;
+  decryptString(value: Buffer): string;
 }
 
 @Injectable()
@@ -118,6 +136,39 @@ export class SyncService {
     return (this.config.store.gdrivesync || {}) as GDriveSyncConfig;
   }
 
+  private getDriveConfiguration(): {
+    useDefaultCredentials: boolean;
+    clientId?: string;
+    clientSecret?: string;
+    storageMode: DriveStorageMode;
+    folderPath?: string;
+    versionHistoryMode: VersionHistoryMode;
+    maxVersionFiles: number;
+    } {
+    const pluginConfig = this.getPluginConfig();
+    const useCustomCredentials = !!pluginConfig.useCustomGoogleCredentials;
+    const clientSecret = useCustomCredentials
+      ? this.getConfiguredGoogleClientSecret(pluginConfig)
+      : undefined;
+
+    return {
+      useDefaultCredentials: !useCustomCredentials,
+      clientId: useCustomCredentials ? pluginConfig.googleClientId : undefined,
+      clientSecret,
+      storageMode: pluginConfig.driveStorageMode || 'appDataFolder',
+      folderPath: pluginConfig.driveFolderPath || '/Tabby Sync/',
+      versionHistoryMode:
+        pluginConfig.versionHistoryMode || 'googleRevisions',
+      maxVersionFiles: this.normalizeMaxVersionFiles(
+        pluginConfig.maxVersionFiles,
+      ),
+    };
+  }
+
+  private configureDrive(): void {
+    this.drive.configure(this.getDriveConfiguration());
+  }
+
   /**
    * Saves plugin configuration.
    */
@@ -131,11 +182,75 @@ export class SyncService {
     const wasApplyingRemote = this.isApplyingRemote;
     this.isApplyingRemote = true;
     try {
-      Object.assign(this.config.store.gdrivesync as object, config);
+      const store = this.config.store.gdrivesync as Record<string, unknown>;
+      for (const [key, value] of Object.entries(config)) {
+        store[key] = value === undefined ? null : value;
+      }
       await this.config.save();
     } finally {
       this.isApplyingRemote = wasApplyingRemote;
     }
+  }
+
+  private getSafeStorage(): ElectronSafeStorage | null {
+    try {
+      if (!electronSafeStorage?.isEncryptionAvailable()) {
+        return null;
+      }
+      return electronSafeStorage;
+    } catch (error) {
+      this.log.warn('Electron safeStorage is not available:', error);
+      return null;
+    }
+  }
+
+  private encryptLocalSecret(secret: string): string {
+    const safeStorage = this.getSafeStorage();
+    if (!safeStorage) {
+      throw new Error('Secure local secret storage is not available');
+    }
+
+    return (
+      SAFE_STORAGE_SECRET_PREFIX +
+      safeStorage.encryptString(secret).toString('base64')
+    );
+  }
+
+  private decryptLocalSecret(encryptedSecret?: string): string {
+    if (!encryptedSecret) {
+      return '';
+    }
+
+    if (!encryptedSecret.startsWith(SAFE_STORAGE_SECRET_PREFIX)) {
+      return '';
+    }
+
+    const safeStorage = this.getSafeStorage();
+    if (!safeStorage) {
+      return '';
+    }
+
+    try {
+      return safeStorage.decryptString(
+        Buffer.from(
+          encryptedSecret.slice(SAFE_STORAGE_SECRET_PREFIX.length),
+          'base64',
+        ),
+      );
+    } catch (error) {
+      this.log.warn('Failed to decrypt Google Client Secret:', error);
+      return '';
+    }
+  }
+
+  private getConfiguredGoogleClientSecret(
+    pluginConfig: GDriveSyncConfig,
+  ): string {
+    return (
+      this.decryptLocalSecret(pluginConfig.googleClientSecretEncrypted) ||
+      pluginConfig.googleClientSecret ||
+      ''
+    );
   }
 
   /**
@@ -155,7 +270,7 @@ export class SyncService {
 
     const pluginConfig = this.getPluginConfig();
 
-    // DriveService is now auto-configured with hardcoded credentials
+    this.configureDrive();
 
     // If we have stored tokens, try to reconnect
     if (pluginConfig.googleAuthTokens && this.drive.isConfigured()) {
@@ -346,14 +461,191 @@ export class SyncService {
    * Always returns true since credentials are hardcoded.
    */
   hasGoogleCredentials(): boolean {
-    return true; // Credentials are now hardcoded in DriveService
+    const pluginConfig = this.getPluginConfig();
+    if (!pluginConfig.useCustomGoogleCredentials) {
+      return true;
+    }
+
+    return !!(
+      pluginConfig.googleClientId &&
+      this.getConfiguredGoogleClientSecret(pluginConfig)
+    );
+  }
+
+  getGoogleCredentialsSettings(): {
+    useCustomGoogleCredentials: boolean;
+    googleClientId: string;
+    googleClientSecret: string;
+    hasSavedGoogleClientSecret: boolean;
+    } {
+    const pluginConfig = this.getPluginConfig();
+    return {
+      useCustomGoogleCredentials: !!pluginConfig.useCustomGoogleCredentials,
+      googleClientId: pluginConfig.googleClientId || '',
+      googleClientSecret: '',
+      hasSavedGoogleClientSecret: !!this.getConfiguredGoogleClientSecret(
+        pluginConfig,
+      ),
+    };
+  }
+
+  async setGoogleCredentialsSettings(settings: {
+    useCustomGoogleCredentials: boolean;
+    googleClientId: string;
+    googleClientSecret: string;
+  }): Promise<SettingsSaveResult> {
+    const pluginConfig = this.getPluginConfig();
+    const existingSecret = this.getConfiguredGoogleClientSecret(pluginConfig);
+    const nextSecret = settings.googleClientSecret.trim() || existingSecret;
+    const nextClientId = settings.googleClientId.trim();
+
+    if (
+      settings.useCustomGoogleCredentials &&
+      (!nextClientId || !nextSecret)
+    ) {
+      throw new Error('Google Client ID and Client Secret are required');
+    }
+
+    const secretChanged = !!(
+      settings.useCustomGoogleCredentials &&
+      settings.googleClientSecret.trim() &&
+      settings.googleClientSecret.trim() !== existingSecret
+    );
+    const credentialsChanged =
+      !!pluginConfig.useCustomGoogleCredentials !==
+        settings.useCustomGoogleCredentials ||
+      (settings.useCustomGoogleCredentials &&
+        (pluginConfig.googleClientId !== nextClientId || secretChanged));
+
+    const encryptedSecret =
+      settings.useCustomGoogleCredentials && nextSecret
+        ? this.encryptLocalSecret(nextSecret)
+        : undefined;
+
+    await this.savePluginConfig({
+      useCustomGoogleCredentials: settings.useCustomGoogleCredentials,
+      googleClientId: nextClientId || undefined,
+      googleClientSecretEncrypted: encryptedSecret,
+      googleClientSecret: undefined,
+      googleAuthTokens: credentialsChanged
+        ? undefined
+        : pluginConfig.googleAuthTokens,
+      driveFileId: credentialsChanged ? undefined : pluginConfig.driveFileId,
+    });
+
+    if (credentialsChanged) {
+      await this.drive.disconnect();
+      this.configureDrive();
+    }
+
+    return { reconnectRequired: credentialsChanged };
+  }
+
+  getDriveStorageSettings(): {
+    driveStorageMode: DriveStorageMode;
+    driveFolderPath: string;
+    } {
+    const pluginConfig = this.getPluginConfig();
+    return {
+      driveStorageMode: pluginConfig.driveStorageMode || 'appDataFolder',
+      driveFolderPath: this.drive.normalizeFolderPath(
+        pluginConfig.driveFolderPath || '/Tabby Sync/',
+      ),
+    };
+  }
+
+  normalizeDriveFolderPath(folderPath: string): string {
+    return this.drive.normalizeFolderPath(folderPath);
+  }
+
+  async setDriveStorageSettings(settings: {
+    driveStorageMode: DriveStorageMode;
+    driveFolderPath: string;
+  }): Promise<SettingsSaveResult> {
+    const pluginConfig = this.getPluginConfig();
+    const previousMode = pluginConfig.driveStorageMode || 'appDataFolder';
+    const normalizedPath = this.drive.normalizeFolderPath(
+      settings.driveFolderPath || '/Tabby Sync/',
+    );
+    const previousPath = this.drive.normalizeFolderPath(
+      pluginConfig.driveFolderPath || '/Tabby Sync/',
+    );
+    const storageModeChanged = previousMode !== settings.driveStorageMode;
+    const storagePathChanged = previousPath !== normalizedPath;
+
+    await this.savePluginConfig({
+      driveStorageMode: settings.driveStorageMode,
+      driveFolderPath: normalizedPath,
+      driveFileId: undefined,
+    });
+
+    if (storageModeChanged) {
+      await this.drive.disconnect();
+      this.configureDrive();
+      return { reconnectRequired: true };
+    }
+
+    if (storagePathChanged) {
+      this.drive.updateStorageTarget(settings.driveStorageMode, normalizedPath);
+    }
+
+    return { reconnectRequired: false };
+  }
+
+  getVersionHistorySettings(): {
+    versionHistoryMode: VersionHistoryMode;
+    maxVersionFiles: number;
+    } {
+    const pluginConfig = this.getPluginConfig();
+    return {
+      versionHistoryMode:
+        pluginConfig.versionHistoryMode || 'googleRevisions',
+      maxVersionFiles: this.normalizeMaxVersionFiles(
+        pluginConfig.maxVersionFiles,
+      ),
+    };
+  }
+
+  async setVersionHistorySettings(settings: {
+    versionHistoryMode: VersionHistoryMode;
+    maxVersionFiles: number;
+  }): Promise<void> {
+    const maxVersionFiles = this.normalizeMaxVersionFiles(
+      settings.maxVersionFiles,
+    );
+
+    await this.savePluginConfig({
+      versionHistoryMode: settings.versionHistoryMode,
+      maxVersionFiles,
+      driveFileId: undefined,
+    });
+    this.drive.updateVersionHistory(
+      settings.versionHistoryMode,
+      maxVersionFiles,
+    );
+  }
+
+  private normalizeMaxVersionFiles(maxVersionFiles?: number): number {
+    const normalized = Math.floor(
+      Number(maxVersionFiles || DEFAULT_MAX_VERSION_FILES),
+    );
+    if (!Number.isFinite(normalized) || normalized < 1) {
+      return 1;
+    }
+    return Math.min(normalized, 1000);
   }
 
   /**
    * Starts the Google Drive authorization flow.
    */
   async connectGoogleDrive(): Promise<boolean> {
+    this.configureDrive();
+
     try {
+      if (!this.hasGoogleCredentials()) {
+        throw new Error('Google OAuth credentials are not configured');
+      }
+
       const tokens = await this.drive.authorize();
 
       // Save tokens
@@ -646,21 +938,24 @@ export class SyncService {
    */
   async listRemoteVersions(): Promise<SyncVersion[]> {
     try {
-      const revisions = await this.drive.listVersions();
-      return revisions
-        .filter((rev) => rev.id && rev.modifiedTime)
-        .map((rev) => ({
-          id: rev.id as string,
-          modifiedTime: rev.modifiedTime as string,
-          size: rev.size,
-          name: `Version ${new Date(rev.modifiedTime as string).toLocaleString()}`,
+      const versions = await this.drive.listVersions();
+      return versions
+        .filter((version) => version.id && version.modifiedTime)
+        .map((version) => ({
+          id: version.id,
+          modifiedTime: version.modifiedTime,
+          size: version.size,
+          name:
+            version.source === 'timestampedFiles'
+              ? version.name
+              : `Version ${new Date(version.modifiedTime).toLocaleString()}`,
+          source: version.source,
         }))
         .sort(
           (a, b) =>
             new Date(b.modifiedTime).getTime() -
             new Date(a.modifiedTime).getTime(),
-        )
-        .slice(0, 20);
+        );
     } catch (error) {
       this.log.error('Failed to list remote versions:', error);
       return [];
