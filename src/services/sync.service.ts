@@ -67,6 +67,12 @@ export interface SyncState {
   pendingChanges: boolean;
 }
 
+export interface PasswordChangeResult {
+  savedLocal: boolean;
+  remoteSynced: boolean;
+  error?: string;
+}
+
 @Injectable()
 export class SyncService {
   private readonly log: Logger;
@@ -250,21 +256,52 @@ export class SyncService {
    * Changes the sync password and re-encrypts the remote file when connected.
    *
    * @param password - New master password
-   * @returns True if the password was saved and remote re-encryption succeeded
+   * @returns Local save and remote re-encryption result
    */
-  async changeMasterPassword(password: string): Promise<boolean> {
+  async changeMasterPassword(password: string): Promise<PasswordChangeResult> {
     if (!password) {
-      return false;
+      return {
+        savedLocal: false,
+        remoteSynced: false,
+        error: 'Password is required',
+      };
     }
 
-    await this.setupMasterPassword(password);
+    try {
+      await this.setupMasterPassword(password);
+    } catch (error) {
+      const errorMsg = (error as Error).message;
+      this.log.error('Failed to save master password:', error);
+      return {
+        savedLocal: false,
+        remoteSynced: false,
+        error: errorMsg,
+      };
+    }
 
     if (this.drive.isConnected()) {
-      const result = await this.syncToRemote();
-      return result.success;
+      try {
+        const result = await this.syncToRemote();
+        return {
+          savedLocal: true,
+          remoteSynced: result.success,
+          error: result.error,
+        };
+      } catch (error) {
+        const errorMsg = (error as Error).message;
+        this.log.error('Remote re-encryption failed:', error);
+        return {
+          savedLocal: true,
+          remoteSynced: false,
+          error: errorMsg,
+        };
+      }
     }
 
-    return true;
+    return {
+      savedLocal: true,
+      remoteSynced: false,
+    };
   }
 
   /**
@@ -388,9 +425,13 @@ export class SyncService {
    * Updates automatic sync interval in minutes.
    */
   async setSyncIntervalMinutes(minutes: number): Promise<void> {
+    const parsed = Number(minutes);
+    const flooredValue = Number.isFinite(parsed)
+      ? Math.floor(parsed)
+      : DEFAULT_SYNC_INTERVAL_MINUTES;
     const normalized = Math.max(
       MIN_SYNC_INTERVAL_MINUTES,
-      Math.floor(Number(minutes) || DEFAULT_SYNC_INTERVAL_MINUTES),
+      flooredValue,
     );
 
     await this.savePluginConfig({ syncIntervalMinutes: normalized });

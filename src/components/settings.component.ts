@@ -655,12 +655,24 @@ export class SettingsComponent implements OnInit, OnDestroy {
     this.passwordError = '';
     this.passwordMessage = '';
     try {
-      if (await this.sync.changeMasterPassword(password)) {
-        this.passwordConfigured = true;
+      const result = await this.sync.changeMasterPassword(password);
+      if (!result.savedLocal) {
+        this.passwordError =
+          'Failed to save sync password' +
+          (result.error ? ': ' + result.error : '');
+        return;
+      }
+
+      this.passwordConfigured = true;
+      this.masterPasswordInput = '';
+
+      if (result.remoteSynced || !this.driveStatus?.connected) {
         this.passwordMessage = 'Sync password saved';
-        this.masterPasswordInput = '';
       } else {
-        this.passwordError = 'Failed to save sync password';
+        this.passwordMessage =
+          'Password saved locally; remote re-encryption failed';
+        this.passwordError =
+          'Try syncing manually' + (result.error ? ': ' + result.error : '');
       }
     } finally {
       this.isSavingPassword = false;
